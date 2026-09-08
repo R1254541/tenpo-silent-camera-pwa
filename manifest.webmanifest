@@ -1,0 +1,10 @@
+{
+  "name": "店舗仕入れ 無音OCRカメラ",
+  "short_name": "仕入れカメラ",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#111111",
+  "orientation": "any",
+  "icons": []
+}
