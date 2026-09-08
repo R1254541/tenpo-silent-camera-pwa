@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
@@ -6,38 +6,37 @@
   <meta name="theme-color" content="#111111" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <title>蠎苓・莉募・繧後き繝｡繝ｩ</title>
+  <title>店舗仕入れカメラ</title>
   <link rel="manifest" href="./manifest.webmanifest" />
-  <link rel="stylesheet" href="./styles.css?v=20260909a" />
+  <link rel="stylesheet" href="./styles.css?v=20260909b" />
 </head>
 <body>
   <main class="app-shell">
-    <section class="camera-stage" aria-label="繧ｫ繝｡繝ｩ">
+    <section class="camera-stage" aria-label="カメラ">
       <video id="preview" autoplay playsinline muted></video>
       <canvas id="captureCanvas" hidden></canvas>
       <div id="focusRing" class="focus-ring" hidden></div>
       <div class="topbar">
-        <button id="flashBtn" class="chip" type="button" disabled>FLASH 窶・/button>
-        <span id="statusChip" class="chip">襍ｷ蜍穂ｸｭ</span>
-        <span id="queueChip" class="chip">譛ｪ騾∽ｿ｡ 0</span>
+        <button id="flashBtn" class="chip" type="button" disabled>LIGHT —</button>
+        <span id="statusChip" class="chip">起動中</span>
+        <span id="localChip" class="chip">端末 0</span>
+        <span id="queueChip" class="chip">未送信 0</span>
       </div>
       <div id="warning" class="warning" hidden></div>
     </section>
-
     <section class="controls">
       <div class="zoom-row">
-        <button class="zoom-btn" data-zoom="1" type="button">1ﾃ・/button>
-        <button class="zoom-btn" data-zoom="2" type="button">2ﾃ・/button>
-        <input id="zoomSlider" type="range" min="1" max="4" value="1" step="0.1" aria-label="繧ｺ繝ｼ繝" />
+        <button class="zoom-btn" data-zoom="1" type="button">1×</button>
+        <button class="zoom-btn" data-zoom="2" type="button">2×</button>
+        <input id="zoomSlider" type="range" min="1" max="4" value="1" step="0.1" aria-label="ズーム" />
       </div>
-      <button id="shutter" class="shutter" type="button" aria-label="謦ｮ蠖ｱ" disabled><span></span></button>
+      <button id="shutter" class="shutter" type="button" aria-label="撮影" disabled><span></span></button>
       <div class="meta-row">
-        <span id="shotCount">謦ｮ蠖ｱ 0</span>
-        <button id="syncBtn" class="text-btn" type="button">蜀埼・/button>
+        <span id="shotCount">撮影 0</span>
+        <button id="syncBtn" class="text-btn" type="button">再送</button>
       </div>
     </section>
   </main>
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=20260909b"></script>
 </body>
 </html>
-
