@@ -1,7 +1,9 @@
 const DB_NAME = 'tenpo-silent-camera';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
+const SESSION_KEY = 'tenpo-camera-session-v1';
+const APP_VERSION = '0.3.0';
 
 const el = {
   video: document.querySelector('#preview'),
@@ -21,8 +23,9 @@ const el = {
 let db;
 let stream;
 let track;
-let sessionId = crypto.randomUUID();
-let sequence = 0;
+const sessionState = loadSessionState();
+let sessionId = sessionState.sessionId;
+let sequence = sessionState.sequence;
 let shotCount = 0;
 let uploading = false;
 let config = loadConfig();
@@ -113,6 +116,74 @@ function isoForFilename(date) {
   return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 }
 
+
+function loadSessionState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || '{}');
+    if (saved.sessionId) return { sessionId: saved.sessionId, sequence: Number(saved.sequence || 0) };
+  } catch {}
+  const next = { sessionId: crypto.randomUUID(), sequence: 0 };
+  localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+  return next;
+}
+
+function saveSessionState() {
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId, sequence }));
+}
+
+async function getOpfsCaptureDir() {
+  if (!navigator.storage?.getDirectory) throw new Error('OPFS_UNAVAILABLE');
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle('captures', { create: true });
+}
+
+async function writeOpfsVerified(filename, blob, expectedSha) {
+  const dir = await getOpfsCaptureDir();
+  const handle = await dir.getFileHandle(filename, { create: true });
+  const writer = await handle.createWritable();
+  await writer.write(blob);
+  await writer.close();
+  const saved = await handle.getFile();
+  if (saved.size !== blob.size) throw new Error('OPFS_SIZE_MISMATCH');
+  const actualSha = await sha256Hex(saved);
+  if (actualSha !== expectedSha) throw new Error('OPFS_HASH_MISMATCH');
+  return { opfsPath: `captures/${filename}`, sizeBytes: saved.size, sha256: actualSha };
+}
+
+async function readOpfsBlob(record) {
+  if (!record.opfsPath) {
+    if (record.blob) return record.blob;
+    throw new Error('LOCAL_FILE_MISSING');
+  }
+  const parts = record.opfsPath.split('/').filter(Boolean);
+  const root = await navigator.storage.getDirectory();
+  let dir = root;
+  for (let i = 0; i < parts.length - 1; i += 1) dir = await dir.getDirectoryHandle(parts[i]);
+  const handle = await dir.getFileHandle(parts.at(-1));
+  const file = await handle.getFile();
+  if (file.size !== record.sizeBytes) throw new Error('LOCAL_SIZE_MISMATCH');
+  const actualSha = await sha256Hex(file);
+  if (actualSha !== record.sha256) throw new Error('LOCAL_HASH_MISMATCH');
+  return file;
+}
+
+async function migrateLegacyBlobs() {
+  if (!navigator.storage?.getDirectory) return;
+  const records = await idbGetAll();
+  for (const record of records) {
+    if (record.opfsPath || !record.blob) continue;
+    const sha = record.sha256 || await sha256Hex(record.blob);
+    const verified = await writeOpfsVerified(record.filename, record.blob, sha);
+    record.opfsPath = verified.opfsPath;
+    record.sha256 = verified.sha256;
+    record.sizeBytes = verified.sizeBytes;
+    record.localState = 'LOCAL_VERIFIED';
+    record.state = record.state === 'VERIFIED' ? 'DRIVE_VERIFIED' : 'QUEUED';
+    delete record.blob;
+    await idbPut(record);
+  }
+}
+
 async function startCamera() {
   setStatus('カメラ許可待ち');
   stream = await navigator.mediaDevices.getUserMedia({
@@ -196,7 +267,7 @@ async function capture() {
     const capturedAt = new Date();
     const captureId = crypto.randomUUID();
     sequence += 1;
-
+    saveSessionState();
     el.canvas.width = el.video.videoWidth;
     el.canvas.height = el.video.videoHeight;
     const ctx = el.canvas.getContext('2d', { alpha: false });
@@ -204,33 +275,21 @@ async function capture() {
     const blob = await canvasBlob(el.canvas, 0.95);
     const sha256 = await sha256Hex(blob);
     const settings = track?.getSettings?.() || {};
-
+    const filename = `TC_${isoForFilename(capturedAt)}_${String(sequence).padStart(4, '0')}_${captureId}.jpg`;
+    setStatus('端末保存中');
+    const local = await writeOpfsVerified(filename, blob, sha256);
     const record = {
-      captureId,
-      sessionId,
-      sequence,
-      capturedAt: capturedAt.toISOString(),
-      filename: `TC_${isoForFilename(capturedAt)}_${String(sequence).padStart(4, '0')}_${captureId}.jpg`,
-      mimeType: 'image/jpeg',
-      sizeBytes: blob.size,
-      sha256,
-      width: el.canvas.width,
-      height: el.canvas.height,
-      zoom: settings.zoom ?? 1,
-      captureEngine: 'pwa-video-frame-canvas',
-      state: 'QUEUED',
-      retryCount: 0,
-      nextAttemptAt: 0,
-      blob,
+      schemaVersion: 3, captureId, sessionId, sequence,
+      capturedAt: capturedAt.toISOString(), filename,
+      opfsPath: local.opfsPath, mimeType: 'image/jpeg',
+      sizeBytes: local.sizeBytes, sha256: local.sha256,
+      width: el.canvas.width, height: el.canvas.height,
+      zoom: settings.zoom ?? 1, captureEngine: 'pwa-video-frame-canvas',
+      localState: 'LOCAL_VERIFIED', state: 'QUEUED', retryCount: 0, nextAttemptAt: 0,
     };
-
     await idbPut(record);
-    const saved = await idbGet(captureId);
-    if (!saved || saved.sizeBytes !== record.sizeBytes || !saved.blob || saved.blob.size !== blob.size) {
-      throw new Error('LOCAL_READBACK_FAILED');
-    }
-    shotCount += 1;
-    el.shotCount.textContent = `撮影 ${shotCount}`;
+    const verifiedBlob = await readOpfsBlob(record);
+    if (verifiedBlob.size !== record.sizeBytes) throw new Error('LOCAL_READBACK_FAILED');
     setStatus('端末保存済み');
     await refreshQueue();
     void drainQueue();
@@ -238,10 +297,9 @@ async function capture() {
     console.error(error);
     showWarning(`保存失敗: ${error?.message || 'unknown'}`);
     setStatus('保存エラー');
-  } finally {
-    el.shutter.disabled = false;
-  }
+  } finally { el.shutter.disabled = false; }
 }
+
 
 function retryDelay(retryCount) {
   return [0, 2000, 5000, 15000, 30000, 60000][Math.min(retryCount, 5)];
@@ -249,62 +307,54 @@ function retryDelay(retryCount) {
 
 async function drainQueue() {
   if (uploading) return;
-  if (!config.endpoint) {
-    setStatus('端末保存のみ');
-    return;
-  }
+  if (!config.endpoint) { setStatus('端末保存のみ'); await refreshQueue(); return; }
   uploading = true;
   try {
     const records = (await idbGetAll())
-      .filter(r => r.state !== 'VERIFIED' && (r.nextAttemptAt || 0) <= Date.now())
+      .filter(r => (r.localState === 'LOCAL_VERIFIED' || r.opfsPath) && r.state !== 'DRIVE_VERIFIED' && (r.nextAttemptAt || 0) <= Date.now())
       .sort((a, b) => a.capturedAt.localeCompare(b.capturedAt));
-
     for (const record of records) {
       if (!navigator.onLine) break;
       try {
         record.state = 'UPLOADING';
         await idbPut(record);
-        await uploadRecord(record);
-        record.state = 'VERIFIED';
+        const ack = await uploadRecord(record);
+        record.state = 'DRIVE_VERIFIED';
+        record.driveFileId = ack.drive_file_id;
+        record.serverId = ack.server_id || null;
+        record.driveVerifiedAt = new Date().toISOString();
+        record.retryCount = 0;
+        record.nextAttemptAt = 0;
         await idbPut(record);
-        // PWA v0.1 safety policy: keep verified JPEGs locally. Cleanup is a later explicit policy.
       } catch (error) {
         console.error('upload failed', error);
         record.retryCount = (record.retryCount || 0) + 1;
         record.state = 'RETRY_WAIT';
         record.nextAttemptAt = Date.now() + retryDelay(record.retryCount);
         await idbPut(record);
+        setTimeout(() => void drainQueue(), retryDelay(record.retryCount));
         break;
       }
       await refreshQueue();
     }
-  } finally {
-    uploading = false;
-    await refreshQueue();
-  }
+  } finally { uploading = false; await refreshQueue(); }
 }
 
+
 async function uploadRecord(record) {
+  const image = await readOpfsBlob(record);
   const meta = {
-    schema_version: '2.1-pwa',
-    capture_id: record.captureId,
-    session_id: record.sessionId,
-    sequence: record.sequence,
-    captured_at: record.capturedAt,
-    device_id: config.deviceId || 'iphone17-main',
-    app_version: '0.1.0',
-    mime_type: record.mimeType,
-    size_bytes: record.sizeBytes,
-    sha256: record.sha256,
-    width: record.width,
-    height: record.height,
-    zoom: record.zoom,
+    schema_version: '3.0-pwa', capture_id: record.captureId,
+    session_id: record.sessionId, sequence: record.sequence,
+    captured_at: record.capturedAt, device_id: config.deviceId || 'iphone17-main',
+    app_version: APP_VERSION, mime_type: record.mimeType,
+    size_bytes: record.sizeBytes, sha256: record.sha256,
+    width: record.width, height: record.height, zoom: record.zoom,
     capture_engine: record.captureEngine,
   };
   const form = new FormData();
-  form.append('image', record.blob, record.filename);
+  form.append('image', image, record.filename);
   form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
-
   const response = await fetch(config.endpoint, {
     method: 'POST',
     headers: config.token ? { 'X-Tenpo-Token': config.token } : {},
@@ -313,14 +363,25 @@ async function uploadRecord(record) {
   if (!response.ok) throw new Error(`HTTP_${response.status}`);
   const body = await response.json().catch(() => ({}));
   if (body.ok === false) throw new Error(body.error || 'SERVER_REJECTED');
+  if (body.verified !== true) throw new Error('SERVER_NOT_VERIFIED');
+  if (!body.drive_file_id) throw new Error('DRIVE_FILE_ID_MISSING');
+  if (body.received_sha256 !== record.sha256) throw new Error('SERVER_HASH_MISMATCH');
+  return body;
 }
+
 
 async function refreshQueue() {
   const records = await idbGetAll();
-  const pending = records.filter(r => r.state !== 'VERIFIED').length;
+  const localVerified = records.filter(r => r.localState === 'LOCAL_VERIFIED' || r.state === 'DRIVE_VERIFIED').length;
+  const driveVerified = records.filter(r => r.state === 'DRIVE_VERIFIED').length;
+  const pending = records.filter(r => (r.localState === 'LOCAL_VERIFIED' || r.opfsPath) && r.state !== 'DRIVE_VERIFIED').length;
+  el.local.textContent = `端末 ${localVerified}`;
+  if (el.drive) el.drive.textContent = `Drive ${driveVerified}`;
   el.queue.textContent = `未送信 ${pending}`;
+  el.shotCount.textContent = `撮影 ${records.filter(r => r.sessionId === sessionId).length}`;
   if (!pending && config.endpoint) setStatus('同期済み');
 }
+
 
 function setStatus(text) { el.status.textContent = text; }
 function showWarning(text) {
@@ -358,6 +419,7 @@ document.querySelectorAll('.zoom-btn').forEach(btn => btn.addEventListener('clic
 el.flash.addEventListener('click', () => { void toggleTorch(); });
 el.video.addEventListener('pointerdown', showFocusRing);
 window.addEventListener('online', () => { setStatus('再接続'); void drainQueue(); });
+window.addEventListener('pageshow', () => { void refreshQueue(); void drainQueue(); });
 window.addEventListener('pagehide', () => stream?.getTracks().forEach(t => t.stop()));
 
 document.addEventListener('visibilitychange', async () => {
@@ -372,6 +434,7 @@ document.addEventListener('visibilitychange', async () => {
     if (!window.isSecureContext) throw new Error('HTTPS_REQUIRED');
     consumeActivationFragment();
     db = await openDb();
+    await migrateLegacyBlobs();
     if (navigator.storage?.persist) { try { await navigator.storage.persist(); } catch {} }
     await recoverInterruptedUploads();
     await registerServiceWorker();
