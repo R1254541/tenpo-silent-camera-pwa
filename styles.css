@@ -19,3 +19,7 @@ button.chip{pointer-events:auto}
 .meta-row{display:flex;justify-content:space-between;align-items:center;font-size:14px;color:#ddd;padding-right:110px}
 @media (orientation:landscape){.app-shell{grid-template-columns:1fr;grid-template-rows:1fr}.controls{position:absolute;z-index:30;left:0;right:0;bottom:0;background:linear-gradient(transparent,rgba(0,0,0,.82));padding:40px 110px max(12px,env(safe-area-inset-bottom)) 16px}.zoom-row{max-width:340px;padding-right:0;grid-template-columns:auto auto 1fr}.meta-row{max-width:340px;padding-right:0;margin-top:8px}.shutter{left:auto;right:max(24px,env(safe-area-inset-right));bottom:50%;transform:translateY(50%)}.warning{left:12px;right:140px;bottom:100px}}
 @media (max-height:500px) and (orientation:portrait){.shutter{width:70px;height:70px}.zoom-row,.meta-row{padding-right:90px}}
+
+/* v0.1.2: shutter fixed at viewport center */
+.shutter{position:fixed!important;left:50%!important;top:50%!important;right:auto!important;bottom:auto!important;transform:translate(-50%,-50%)!important;z-index:9999!important;margin:0!important;width:86px!important;height:86px!important;touch-action:manipulation}
+@media (orientation:landscape){.shutter{left:50%!important;top:50%!important;right:auto!important;bottom:auto!important;transform:translate(-50%,-50%)!important}}
