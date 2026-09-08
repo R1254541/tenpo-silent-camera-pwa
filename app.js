@@ -9,6 +9,7 @@ const el = {
   shutter: document.querySelector('#shutter'),
   status: document.querySelector('#statusChip'),
   queue: document.querySelector('#queueChip'),
+  local: document.querySelector('#localChip'),
   shotCount: document.querySelector('#shotCount'),
   sync: document.querySelector('#syncBtn'),
   zoom: document.querySelector('#zoomSlider'),
@@ -74,6 +75,14 @@ function idbPut(record) {
   return new Promise((resolve, reject) => {
     const req = tx('readwrite').put(record);
     req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbGet(captureId) {
+  return new Promise((resolve, reject) => {
+    const req = tx().get(captureId);
+    req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
@@ -216,6 +225,10 @@ async function capture() {
     };
 
     await idbPut(record);
+    const saved = await idbGet(captureId);
+    if (!saved || saved.sizeBytes !== record.sizeBytes || !saved.blob || saved.blob.size !== blob.size) {
+      throw new Error('LOCAL_READBACK_FAILED');
+    }
     shotCount += 1;
     el.shotCount.textContent = `撮影 ${shotCount}`;
     setStatus('端末保存済み');
@@ -359,6 +372,7 @@ document.addEventListener('visibilitychange', async () => {
     if (!window.isSecureContext) throw new Error('HTTPS_REQUIRED');
     consumeActivationFragment();
     db = await openDb();
+    if (navigator.storage?.persist) { try { await navigator.storage.persist(); } catch {} }
     await recoverInterruptedUploads();
     await registerServiceWorker();
     await refreshQueue();
