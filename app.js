@@ -3,7 +3,7 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.6.1';
+const APP_VERSION = '0.6.2';
 const COMMIT_IDLE_MS = 60000;
 
 const el = {
@@ -446,11 +446,17 @@ async function uploadRecord(record) {
   if ((config.transport || '').toLowerCase() === 'apps-script') {
     body = await postViaIframe({ action: 'capture', token: config.token || '', meta: JSON.stringify(meta), image_b64: await blobToBase64(image) });
   } else {
-    const form = new FormData();
-    form.append('image', image, record.filename);
-    form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
     const target = (config.transport || '').toLowerCase() === 'cloud-run' ? `${config.endpoint}/capture` : config.endpoint;
-    const response = await fetch(target, { method: 'POST', headers: config.token ? { 'X-Tenpo-Token': config.token } : {}, body: form });
+    let response;
+    if ((config.transport || '').toLowerCase() === 'cloud-run') {
+      const payload = { meta, image_b64: await blobToBase64(image) };
+      response = await fetch(target, { method: 'POST', headers: { 'Content-Type':'application/json', ...(config.token ? { 'X-Tenpo-Token': config.token } : {}) }, body: JSON.stringify(payload) });
+    } else {
+      const form = new FormData();
+      form.append('image', image, record.filename);
+      form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
+      response = await fetch(target, { method: 'POST', headers: config.token ? { 'X-Tenpo-Token': config.token } : {}, body: form });
+    }
     if (!response.ok) throw new Error(`HTTP_${response.status}`);
     body = await response.json().catch(() => ({}));
   }
