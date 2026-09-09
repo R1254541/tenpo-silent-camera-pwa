@@ -3,7 +3,8 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '0.5.0';
+const COMMIT_IDLE_MS = 60000;
 
 const el = {
   video: document.querySelector('#preview'),
@@ -35,6 +36,7 @@ let sessionId = sessionState.sessionId;
 let sequence = sessionState.sequence;
 let shotCount = 0;
 let uploading = false;
+let commitTimer = null;
 let config = loadConfig();
 
 function loadConfig() {
@@ -52,10 +54,12 @@ function consumeActivationFragment() {
   const p = new URLSearchParams(location.hash.slice(1));
   const endpoint = p.get('endpoint');
   const token = p.get('token');
-  if (endpoint || token) {
+  const transport = p.get('transport');
+  if (endpoint || token || transport) {
     saveConfig({
       ...(endpoint ? { endpoint } : {}),
       ...(token ? { token } : {}),
+      ...(transport ? { transport } : {}),
     });
     history.replaceState(null, '', location.pathname + location.search);
   }
@@ -127,15 +131,16 @@ function isoForFilename(date) {
 function loadSessionState() {
   try {
     const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || '{}');
-    if (saved.sessionId) return { sessionId: saved.sessionId, sequence: Number(saved.sequence || 0) };
+    if (saved.sessionId) return { sessionId: saved.sessionId, sequence: Number(saved.sequence || 0), lastCaptureAt: saved.lastCaptureAt || null, released: Boolean(saved.released) };
   } catch {}
   const next = { sessionId: crypto.randomUUID(), sequence: 0 };
   localStorage.setItem(SESSION_KEY, JSON.stringify(next));
   return next;
 }
 
-function saveSessionState() {
-  localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId, sequence }));
+function saveSessionState(extra = {}) {
+  const current = loadSessionState();
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId, sequence, lastCaptureAt: current.lastCaptureAt || null, released: current.released || false, ...extra }));
 }
 
 async function getOpfsCaptureDir() {
@@ -298,8 +303,10 @@ async function capture() {
   try {
     const capturedAt = new Date();
     const captureId = crypto.randomUUID();
+    const sess = loadSessionState();
+    if (sess.released) { sessionId = crypto.randomUUID(); sequence = 0; saveSessionState({ released: false, lastCaptureAt: null }); }
     sequence += 1;
-    saveSessionState();
+    saveSessionState({ released: false, lastCaptureAt: capturedAt.toISOString() });
     el.canvas.width = el.video.videoWidth;
     el.canvas.height = el.video.videoHeight;
     const ctx = el.canvas.getContext('2d', { alpha: false });
@@ -325,6 +332,7 @@ async function capture() {
     setStatus('端末保存済み');
     await refreshQueue();
     void drainQueue();
+    scheduleSessionCommit();
   } catch (error) {
     console.error(error);
     showWarning(`保存失敗: ${error?.message || 'unknown'}`);
@@ -369,9 +377,42 @@ async function drainQueue() {
       }
       await refreshQueue();
     }
-  } finally { uploading = false; await refreshQueue(); }
+  } finally { uploading = false; await refreshQueue(); scheduleSessionCommit(); }
 }
 
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = () => reject(reader.error || new Error('BASE64_ENCODE_FAILED'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function postViaIframe(fields, timeoutMs = 90000) {
+  return new Promise((resolve, reject) => {
+    const iframe = document.createElement('iframe');
+    const frameName = `tenpo_ingress_${crypto.randomUUID()}`;
+    iframe.name = frameName; iframe.hidden = true;
+    const form = document.createElement('form');
+    form.method = 'POST'; form.action = config.endpoint; form.target = frameName;
+    form.enctype = 'multipart/form-data'; form.hidden = true;
+    Object.entries(fields).forEach(([name, value]) => {
+      const input = document.createElement(name === 'image_b64' ? 'textarea' : 'input');
+      input.name = name; input.value = String(value ?? ''); form.appendChild(input);
+    });
+    let timer;
+    const cleanup = () => { clearTimeout(timer); window.removeEventListener('message', onMessage); form.remove(); iframe.remove(); };
+    const onMessage = event => {
+      if (event.source !== iframe.contentWindow || !event.data || typeof event.data !== 'object') return;
+      cleanup(); event.data.ok === false ? reject(new Error(event.data.error || 'SERVER_REJECTED')) : resolve(event.data);
+    };
+    window.addEventListener('message', onMessage); document.body.append(iframe, form);
+    timer = setTimeout(() => { cleanup(); reject(new Error('INGRESS_TIMEOUT')); }, timeoutMs);
+    form.submit();
+  });
+}
 
 async function uploadRecord(record) {
   const image = await readOpfsBlob(record);
@@ -384,16 +425,17 @@ async function uploadRecord(record) {
     width: record.width, height: record.height, zoom: record.zoom,
     capture_engine: record.captureEngine,
   };
-  const form = new FormData();
-  form.append('image', image, record.filename);
-  form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
-  const response = await fetch(config.endpoint, {
-    method: 'POST',
-    headers: config.token ? { 'X-Tenpo-Token': config.token } : {},
-    body: form,
-  });
-  if (!response.ok) throw new Error(`HTTP_${response.status}`);
-  const body = await response.json().catch(() => ({}));
+  let body;
+  if ((config.transport || '').toLowerCase() === 'apps-script') {
+    body = await postViaIframe({ action: 'capture', token: config.token || '', meta: JSON.stringify(meta), image_b64: await blobToBase64(image) });
+  } else {
+    const form = new FormData();
+    form.append('image', image, record.filename);
+    form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
+    const response = await fetch(config.endpoint, { method: 'POST', headers: config.token ? { 'X-Tenpo-Token': config.token } : {}, body: form });
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    body = await response.json().catch(() => ({}));
+  }
   if (body.ok === false) throw new Error(body.error || 'SERVER_REJECTED');
   if (body.verified !== true) throw new Error('SERVER_NOT_VERIFIED');
   if (!body.drive_file_id) throw new Error('DRIVE_FILE_ID_MISSING');
@@ -401,6 +443,34 @@ async function uploadRecord(record) {
   return body;
 }
 
+
+async function commitCurrentSession() {
+  if (!config.endpoint || (config.transport || '').toLowerCase() !== 'apps-script') return false;
+  const sess = loadSessionState();
+  if (!sess.sessionId || sess.released || !sess.sequence) return false;
+  const records = (await idbGetAll()).filter(r => r.sessionId === sess.sessionId);
+  if (records.length !== sess.sequence || records.some(r => r.state !== 'DRIVE_VERIFIED')) return false;
+  const body = await postViaIframe({ action: 'commit', token: config.token || '', session_id: sess.sessionId, expected_count: sess.sequence });
+  if (body.released !== true) throw new Error('SESSION_NOT_RELEASED');
+  saveSessionState({ released: true, lastCaptureAt: sess.lastCaptureAt || null });
+  setStatus('Drive保存済み');
+  return true;
+}
+
+function scheduleSessionCommit() {
+  clearTimeout(commitTimer);
+  const sess = loadSessionState();
+  if (!sess.lastCaptureAt || sess.released) return;
+  const due = Math.max(0, COMMIT_IDLE_MS - (Date.now() - Date.parse(sess.lastCaptureAt)));
+  commitTimer = setTimeout(() => { void commitCurrentSession().catch(err => console.warn('commit failed', err)); }, due);
+}
+
+async function recoverSessionCommit() {
+  const sess = loadSessionState();
+  if (!sess.lastCaptureAt || sess.released) return;
+  if (Date.now() - Date.parse(sess.lastCaptureAt) >= COMMIT_IDLE_MS) await commitCurrentSession();
+  else scheduleSessionCommit();
+}
 
 async function refreshQueue() {
   const records = await idbGetAll();
@@ -509,6 +579,7 @@ document.addEventListener('visibilitychange', async () => {
     await refreshQueue();
     await startCamera();
     void drainQueue();
+    void recoverSessionCommit().catch(err => console.warn('commit recovery failed', err));
   } catch (error) {
     console.error(error);
     setStatus('起動失敗');
