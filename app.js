@@ -3,7 +3,7 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.6.2';
+const APP_VERSION = '0.6.3';
 const COMMIT_IDLE_MS = 60000;
 
 const el = {
@@ -528,6 +528,25 @@ function scheduleSessionCommit() {
   commitTimer = setTimeout(() => { void commitCurrentSession().catch(err => console.warn('commit failed', err)); }, due);
 }
 
+async function recoverHistoricalSessions() {
+  const records = await idbGetAll();
+  const groups = new Map();
+  for (const r of records) {
+    if (!r.sessionId || !['INGRESS_VERIFIED','DRIVE_VERIFIED'].includes(r.state)) continue;
+    if (!groups.has(r.sessionId)) groups.set(r.sessionId, []);
+    groups.get(r.sessionId).push(r);
+  }
+  for (const [sid, items] of groups) {
+    const seqs = items.map(r => Number(r.sequence)).sort((a,b)=>a-b);
+    if (!seqs.length || seqs.some((v,i)=>v!==i+1)) continue;
+    sessionId = sid; sequence = items.length;
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId:sid, sequence:items.length, lastCaptureAt:items.map(r=>r.capturedAt).sort().at(-1), released:false }));
+    try { await commitCurrentSession(); } catch (err) { console.warn('historical commit failed', sid, err); }
+  }
+  sessionId = crypto.randomUUID(); sequence = 0;
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId, sequence, lastCaptureAt:null, released:false }));
+}
+
 async function recoverSessionCommit() {
   const sess = loadSessionState();
   if (!sess.lastCaptureAt || sess.released) return;
@@ -643,7 +662,7 @@ document.addEventListener('visibilitychange', async () => {
     await refreshQueue();
     await startCamera();
     void drainQueue();
-    void recoverSessionCommit().catch(err => console.warn('commit recovery failed', err));
+    void recoverHistoricalSessions().then(() => checkDriveStatuses()).catch(err => console.warn('historical recovery failed', err));
     void checkDriveStatuses();
     setInterval(() => { if (document.visibilityState === 'visible') void checkDriveStatuses(); }, 15000);
   } catch (error) {
