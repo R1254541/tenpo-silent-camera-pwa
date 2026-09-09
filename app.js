@@ -3,7 +3,7 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.6.3';
+const APP_VERSION = '0.6.4';
 const COMMIT_IDLE_MS = 60000;
 
 const el = {
@@ -390,7 +390,7 @@ async function drainQueue() {
         record.nextAttemptAt = Date.now() + retryDelay(record.retryCount);
         await idbPut(record);
         setTimeout(() => void drainQueue(), retryDelay(record.retryCount));
-        break;
+        continue;
       }
       await refreshQueue();
     }
@@ -472,27 +472,34 @@ async function uploadRecord(record) {
 }
 
 
-async function commitCurrentSession() {
-  if (!config.endpoint) return false;
+async function commitSessionById(sid, expectedCount) {
+  if (!config.endpoint || !sid || !expectedCount) return false;
   const transport = (config.transport || '').toLowerCase();
   if (!['apps-script','cloud-run'].includes(transport)) return false;
-  const sess = loadSessionState();
-  if (!sess.sessionId || sess.released || !sess.sequence) return false;
-  const records = (await idbGetAll()).filter(r => r.sessionId === sess.sessionId);
+  const records = (await idbGetAll()).filter(r => r.sessionId === sid);
   const accepted = transport === 'cloud-run' ? ['INGRESS_VERIFIED','DRIVE_VERIFIED'] : ['DRIVE_VERIFIED'];
-  if (records.length !== sess.sequence || records.some(r => !accepted.includes(r.state))) return false;
+  const seqs = records.map(r => Number(r.sequence)).sort((a,b)=>a-b);
+  if (records.length !== expectedCount || seqs.some((v,i)=>v!==i+1) || records.some(r => !accepted.includes(r.state))) return false;
   let body;
   if (transport === 'apps-script') {
-    body = await postViaIframe({ action: 'commit', token: config.token || '', session_id: sess.sessionId, expected_count: sess.sequence });
+    body = await postViaIframe({ action: 'commit', token: config.token || '', session_id: sid, expected_count: expectedCount });
   } else {
-    const response = await fetch(`${config.endpoint}/commit`, { method:'POST', headers:{ 'Content-Type':'application/json', ...(config.token ? { 'X-Tenpo-Token': config.token } : {}) }, body:JSON.stringify({ session_id:sess.sessionId, expected_count:sess.sequence }) });
+    const response = await fetch(`${config.endpoint}/commit`, { method:'POST', headers:{ 'Content-Type':'application/json', ...(config.token ? { 'X-Tenpo-Token': config.token } : {}) }, body:JSON.stringify({ session_id:sid, expected_count:expectedCount }) });
     if (!response.ok) throw new Error(`COMMIT_HTTP_${response.status}`);
     body = await response.json();
   }
   if (body.released !== true) throw new Error('SESSION_NOT_RELEASED');
-  saveSessionState({ released: true, lastCaptureAt: sess.lastCaptureAt || null });
-  setStatus(transport === 'cloud-run' ? 'Drive反映待ち' : 'Drive保存済み');
-  if (transport === 'cloud-run') void checkDriveStatuses();
+  return true;
+}
+
+async function commitCurrentSession() {
+  const sess = loadSessionState();
+  if (!sess.sessionId || sess.released || !sess.sequence) return false;
+  const ok = await commitSessionById(sess.sessionId, sess.sequence);
+  if (!ok) return false;
+  saveSessionState({ released:true, lastCaptureAt:sess.lastCaptureAt || null });
+  setStatus((config.transport || '').toLowerCase() === 'cloud-run' ? 'Drive反映待ち' : 'Drive保存済み');
+  if ((config.transport || '').toLowerCase() === 'cloud-run') void checkDriveStatuses();
   return true;
 }
 
@@ -530,21 +537,20 @@ function scheduleSessionCommit() {
 
 async function recoverHistoricalSessions() {
   const records = await idbGetAll();
+  const current = loadSessionState().sessionId;
   const groups = new Map();
   for (const r of records) {
-    if (!r.sessionId || !['INGRESS_VERIFIED','DRIVE_VERIFIED'].includes(r.state)) continue;
+    if (!r.sessionId || r.sessionId === current) continue;
     if (!groups.has(r.sessionId)) groups.set(r.sessionId, []);
     groups.get(r.sessionId).push(r);
   }
   for (const [sid, items] of groups) {
     const seqs = items.map(r => Number(r.sequence)).sort((a,b)=>a-b);
     if (!seqs.length || seqs.some((v,i)=>v!==i+1)) continue;
-    sessionId = sid; sequence = items.length;
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId:sid, sequence:items.length, lastCaptureAt:items.map(r=>r.capturedAt).sort().at(-1), released:false }));
-    try { await commitCurrentSession(); } catch (err) { console.warn('historical commit failed', sid, err); }
+    const accepted = (config.transport || '').toLowerCase() === 'cloud-run' ? ['INGRESS_VERIFIED','DRIVE_VERIFIED'] : ['DRIVE_VERIFIED'];
+    if (items.some(r => !accepted.includes(r.state))) continue;
+    try { await commitSessionById(sid, items.length); } catch (err) { console.warn('historical commit failed', sid, err); }
   }
-  sessionId = crypto.randomUUID(); sequence = 0;
-  localStorage.setItem(SESSION_KEY, JSON.stringify({ sessionId, sequence, lastCaptureAt:null, released:false }));
 }
 
 async function recoverSessionCommit() {
@@ -563,7 +569,7 @@ async function refreshQueue() {
   if (el.drive) el.drive.textContent = `Drive ${driveVerified}`;
   el.queue.textContent = `未送信 ${pending}`;
   el.shotCount.textContent = `撮影 ${records.filter(r => r.sessionId === sessionId).length}`;
-  if (!pending && config.endpoint) setStatus('同期済み');
+  if (!pending && config.endpoint) setStatus('Drive保存済み');
 }
 
 
@@ -661,9 +667,10 @@ document.addEventListener('visibilitychange', async () => {
     await registerServiceWorker();
     await refreshQueue();
     await startCamera();
-    void drainQueue();
-    void recoverHistoricalSessions().then(() => checkDriveStatuses()).catch(err => console.warn('historical recovery failed', err));
-    void checkDriveStatuses();
+    await drainQueue();
+    await recoverHistoricalSessions();
+    await recoverSessionCommit();
+    await checkDriveStatuses();
     setInterval(() => { if (document.visibilityState === 'visible') void checkDriveStatuses(); }, 15000);
   } catch (error) {
     console.error(error);

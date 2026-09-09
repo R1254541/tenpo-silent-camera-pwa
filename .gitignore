@@ -1,0 +1,14 @@
+# Secrets
+**/token.txt
+**/*_token.txt
+ingress/cloudrun_token.txt
+
+# Local patch / diagnostic helpers
+patch_*.py
+fix_*.py
+fix_*.mjs
+ingress/**/patch_*.py
+
+# Python
+__pycache__/
+*.pyc
