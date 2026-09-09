@@ -8,7 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>店舗仕入れカメラ</title>
   <link rel="manifest" href="./manifest.webmanifest" />
-  <link rel="stylesheet" href="./styles.css?v=20260909c" />
+  <link rel="stylesheet" href="./styles.css?v=20260909d" />
 </head>
 <body>
   <main class="app-shell">
@@ -34,10 +34,18 @@
       <button id="shutter" class="shutter" type="button" aria-label="撮影" disabled><span></span></button>
       <div class="meta-row">
         <span id="shotCount">撮影 0</span>
-        <button id="syncBtn" class="text-btn" type="button">再送</button>
+        <div class="meta-actions"><button id="galleryBtn" class="text-btn" type="button">端末写真</button><button id="syncBtn" class="text-btn" type="button">再送</button></div>
       </div>
     </section>
   </main>
-  <script type="module" src="./app.js?v=20260909c"></script>
+  <section id="localGallery" class="gallery" hidden aria-hidden="true" aria-label="端末内写真">
+    <div class="gallery-panel">
+      <header class="gallery-header"><div><strong>端末内写真</strong><div id="gallerySummary" class="gallery-summary"></div></div><button id="galleryClose" type="button" class="gallery-close">閉じる</button></header>
+      <div class="gallery-help">Drive連携が切れていても、ここに表示される写真は端末側に残っています。「共有・保存」から写真アプリやファイルへ手動退避できます。</div>
+      <div id="galleryList" class="gallery-list"></div>
+      <footer class="gallery-footer"><button id="galleryRetry" class="text-btn" type="button">未送信をすべて再送</button></footer>
+    </div>
+  </section>
+  <script type="module" src="./app.js?v=20260909d"></script>
 </body>
 </html>

@@ -3,7 +3,7 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.4.0';
 
 const el = {
   video: document.querySelector('#preview'),
@@ -12,6 +12,13 @@ const el = {
   status: document.querySelector('#statusChip'),
   queue: document.querySelector('#queueChip'),
   local: document.querySelector('#localChip'),
+  drive: document.querySelector('#driveChip'),
+  galleryOpen: document.querySelector('#galleryBtn'),
+  gallery: document.querySelector('#localGallery'),
+  galleryClose: document.querySelector('#galleryClose'),
+  galleryList: document.querySelector('#galleryList'),
+  gallerySummary: document.querySelector('#gallerySummary'),
+  galleryRetry: document.querySelector('#galleryRetry'),
   shotCount: document.querySelector('#shotCount'),
   sync: document.querySelector('#syncBtn'),
   zoom: document.querySelector('#zoomSlider'),
@@ -182,6 +189,31 @@ async function migrateLegacyBlobs() {
     delete record.blob;
     await idbPut(record);
   }
+}
+
+function statusLabel(record) {
+  if (record.state === 'DRIVE_VERIFIED') return 'Drive保存済み';
+  if (record.state === 'UPLOADING') return 'Drive送信中';
+  if (record.state === 'RETRY_WAIT') return '同期待ち';
+  return '端末保存済み';
+}
+
+function formatCapturedAt(value) {
+  try { return new Intl.DateTimeFormat('ja-JP', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value)); }
+  catch { return value || ''; }
+}
+
+async function shareLocalPhoto(record) {
+  const blob = await readOpfsBlob(record);
+  const file = new File([blob], record.filename, { type: 'image/jpeg' });
+  if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+    await navigator.share({ files: [file], title: '店舗仕入れ写真' });
+    return;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = record.filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
 }
 
 async function startCamera() {
@@ -383,6 +415,39 @@ async function refreshQueue() {
 }
 
 
+async function renderGallery() {
+  const records = (await idbGetAll()).sort((a,b) => b.capturedAt.localeCompare(a.capturedAt));
+  const driveCount = records.filter(r => r.state === 'DRIVE_VERIFIED').length;
+  el.gallerySummary.textContent = `端末 ${records.length}枚 / Drive ${driveCount}枚 / 未送信 ${records.length-driveCount}枚`;
+  el.galleryList.replaceChildren();
+  for (const record of records) {
+    const card = document.createElement('article'); card.className = 'gallery-card';
+    const img = document.createElement('img'); img.alt = formatCapturedAt(record.capturedAt);
+    try { const blob = await readOpfsBlob(record); img.src = URL.createObjectURL(blob); img.onload=()=>setTimeout(()=>URL.revokeObjectURL(img.src),30000); }
+    catch { card.classList.add('gallery-error'); }
+    const meta = document.createElement('div'); meta.className='gallery-meta';
+    const time = document.createElement('div'); time.textContent = formatCapturedAt(record.capturedAt);
+    const state = document.createElement('div'); state.className='gallery-state'; state.textContent = statusLabel(record);
+    const actions = document.createElement('div'); actions.className='gallery-actions';
+    const share = document.createElement('button'); share.type='button'; share.textContent='共有・保存';
+    share.addEventListener('click', async()=>{ try{ await shareLocalPhoto(record); }catch(e){ if(e?.name!=='AbortError') showWarning('共有できませんでした'); }});
+    actions.append(share);
+    if (record.state !== 'DRIVE_VERIFIED') {
+      const retry=document.createElement('button'); retry.type='button'; retry.textContent='再送';
+      retry.addEventListener('click', async()=>{ record.state='QUEUED'; record.nextAttemptAt=0; await idbPut(record); await refreshQueue(); void drainQueue(); await renderGallery(); });
+      actions.append(retry);
+    }
+    meta.append(time,state,actions); card.append(img,meta); el.galleryList.append(card);
+  }
+  if (!records.length) el.galleryList.textContent='端末内に写真はありません';
+}
+
+async function openGallery() {
+  el.gallery.hidden=false; el.gallery.setAttribute('aria-hidden','false');
+  await renderGallery();
+}
+function closeGallery(){ el.gallery.hidden=true; el.gallery.setAttribute('aria-hidden','true'); }
+
 function setStatus(text) { el.status.textContent = text; }
 function showWarning(text) {
   el.warning.textContent = text;
@@ -411,6 +476,9 @@ async function registerServiceWorker() {
 
 el.shutter.addEventListener('click', capture);
 el.sync.addEventListener('click', () => { void drainQueue(); });
+el.galleryOpen.addEventListener('click', () => { void openGallery(); });
+el.galleryClose.addEventListener('click', closeGallery);
+el.galleryRetry.addEventListener('click', async () => { const records=await idbGetAll(); for (const r of records) { if (r.state !== 'DRIVE_VERIFIED') { r.state='QUEUED'; r.nextAttemptAt=0; await idbPut(r); } } await refreshQueue(); await renderGallery(); void drainQueue(); });
 el.zoom.addEventListener('input', e => { void applyZoom(e.target.value); });
 document.querySelectorAll('.zoom-btn').forEach(btn => btn.addEventListener('click', () => {
   el.zoom.value = btn.dataset.zoom;

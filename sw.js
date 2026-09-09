@@ -1,4 +1,4 @@
-const CACHE = 'tenpo-camera-v0.3.0';
+const CACHE = 'tenpo-camera-v0.4.0';
 const ASSETS = ['./','./index.html','./styles.css','./app.js','./manifest.webmanifest'];
 
 self.addEventListener('install', event => {
