@@ -1,4 +1,4 @@
-const CACHE = 'tenpo-camera-v0.5.0';
+﻿const CACHE = 'tenpo-camera-v0.5.0';
 const ASSETS = ['./','./index.html','./styles.css','./app.js','./manifest.webmanifest'];
 
 self.addEventListener('install', event => {
@@ -17,4 +17,5 @@ self.addEventListener('fetch', event => {
     return response;
   }).catch(() => caches.match(event.request).then(hit => hit || caches.match('./index.html'))));
 });
+
 
