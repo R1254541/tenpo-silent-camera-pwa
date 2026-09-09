@@ -3,7 +3,7 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.5.0';
+const APP_VERSION = '0.6.0';
 const COMMIT_IDLE_MS = 60000;
 
 const el = {
@@ -198,7 +198,8 @@ async function migrateLegacyBlobs() {
 
 function statusLabel(record) {
   if (record.state === 'DRIVE_VERIFIED') return 'Drive保存済み';
-  if (record.state === 'UPLOADING') return 'Drive送信中';
+  if (record.state === 'UPLOADING') return '送信中';
+  if (record.state === 'INGRESS_VERIFIED') return 'Drive反映待ち';
   if (record.state === 'RETRY_WAIT') return '同期待ち';
   return '端末保存済み';
 }
@@ -351,7 +352,7 @@ async function drainQueue() {
   uploading = true;
   try {
     const records = (await idbGetAll())
-      .filter(r => (r.localState === 'LOCAL_VERIFIED' || r.opfsPath) && r.state !== 'DRIVE_VERIFIED' && (r.nextAttemptAt || 0) <= Date.now())
+      .filter(r => (r.localState === 'LOCAL_VERIFIED' || r.opfsPath) && !['DRIVE_VERIFIED','INGRESS_VERIFIED'].includes(r.state) && (r.nextAttemptAt || 0) <= Date.now())
       .sort((a, b) => a.capturedAt.localeCompare(b.capturedAt));
     for (const record of records) {
       if (!navigator.onLine) break;
@@ -359,10 +360,16 @@ async function drainQueue() {
         record.state = 'UPLOADING';
         await idbPut(record);
         const ack = await uploadRecord(record);
-        record.state = 'DRIVE_VERIFIED';
-        record.driveFileId = ack.drive_file_id;
-        record.serverId = ack.server_id || null;
-        record.driveVerifiedAt = new Date().toISOString();
+        if ((config.transport || '').toLowerCase() === 'cloud-run') {
+          record.state = 'INGRESS_VERIFIED';
+          record.serverId = ack.server_id || null;
+          record.ingressVerifiedAt = new Date().toISOString();
+        } else {
+          record.state = 'DRIVE_VERIFIED';
+          record.driveFileId = ack.drive_file_id;
+          record.serverId = ack.server_id || null;
+          record.driveVerifiedAt = new Date().toISOString();
+        }
         record.retryCount = 0;
         record.nextAttemptAt = 0;
         await idbPut(record);
@@ -432,29 +439,69 @@ async function uploadRecord(record) {
     const form = new FormData();
     form.append('image', image, record.filename);
     form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }), 'meta.json');
-    const response = await fetch(config.endpoint, { method: 'POST', headers: config.token ? { 'X-Tenpo-Token': config.token } : {}, body: form });
+    const target = (config.transport || '').toLowerCase() === 'cloud-run' ? `${config.endpoint}/capture` : config.endpoint;
+    const response = await fetch(target, { method: 'POST', headers: config.token ? { 'X-Tenpo-Token': config.token } : {}, body: form });
     if (!response.ok) throw new Error(`HTTP_${response.status}`);
     body = await response.json().catch(() => ({}));
   }
   if (body.ok === false) throw new Error(body.error || 'SERVER_REJECTED');
-  if (body.verified !== true) throw new Error('SERVER_NOT_VERIFIED');
-  if (!body.drive_file_id) throw new Error('DRIVE_FILE_ID_MISSING');
+  if ((config.transport || '').toLowerCase() === 'cloud-run') {
+    if (body.ingress_verified !== true) throw new Error('INGRESS_NOT_VERIFIED');
+  } else {
+    if (body.verified !== true) throw new Error('SERVER_NOT_VERIFIED');
+    if (!body.drive_file_id) throw new Error('DRIVE_FILE_ID_MISSING');
+  }
   if (body.received_sha256 !== record.sha256) throw new Error('SERVER_HASH_MISMATCH');
   return body;
 }
 
 
 async function commitCurrentSession() {
-  if (!config.endpoint || (config.transport || '').toLowerCase() !== 'apps-script') return false;
+  if (!config.endpoint) return false;
+  const transport = (config.transport || '').toLowerCase();
+  if (!['apps-script','cloud-run'].includes(transport)) return false;
   const sess = loadSessionState();
   if (!sess.sessionId || sess.released || !sess.sequence) return false;
   const records = (await idbGetAll()).filter(r => r.sessionId === sess.sessionId);
-  if (records.length !== sess.sequence || records.some(r => r.state !== 'DRIVE_VERIFIED')) return false;
-  const body = await postViaIframe({ action: 'commit', token: config.token || '', session_id: sess.sessionId, expected_count: sess.sequence });
+  const accepted = transport === 'cloud-run' ? ['INGRESS_VERIFIED','DRIVE_VERIFIED'] : ['DRIVE_VERIFIED'];
+  if (records.length !== sess.sequence || records.some(r => !accepted.includes(r.state))) return false;
+  let body;
+  if (transport === 'apps-script') {
+    body = await postViaIframe({ action: 'commit', token: config.token || '', session_id: sess.sessionId, expected_count: sess.sequence });
+  } else {
+    const response = await fetch(`${config.endpoint}/commit`, { method:'POST', headers:{ 'Content-Type':'application/json', ...(config.token ? { 'X-Tenpo-Token': config.token } : {}) }, body:JSON.stringify({ session_id:sess.sessionId, expected_count:sess.sequence }) });
+    if (!response.ok) throw new Error(`COMMIT_HTTP_${response.status}`);
+    body = await response.json();
+  }
   if (body.released !== true) throw new Error('SESSION_NOT_RELEASED');
   saveSessionState({ released: true, lastCaptureAt: sess.lastCaptureAt || null });
-  setStatus('Drive保存済み');
+  setStatus(transport === 'cloud-run' ? 'Drive反映待ち' : 'Drive保存済み');
+  if (transport === 'cloud-run') void checkDriveStatuses();
   return true;
+}
+
+async function checkDriveStatuses() {
+  if ((config.transport || '').toLowerCase() !== 'cloud-run' || !config.endpoint) return;
+  const records = await idbGetAll();
+  const sessionIds = [...new Set(records.filter(r => r.state === 'INGRESS_VERIFIED').map(r => r.sessionId))];
+  for (const sid of sessionIds) {
+    try {
+      const response = await fetch(`${config.endpoint}/status/${encodeURIComponent(sid)}`, { headers: config.token ? { 'X-Tenpo-Token': config.token } : {} });
+      if (!response.ok) continue;
+      const body = await response.json();
+      if (body.drive_verified !== true || !Array.isArray(body.images)) continue;
+      const byId = new Map(body.images.map(x => [x.capture_id, x]));
+      for (const record of records.filter(r => r.sessionId === sid && r.state === 'INGRESS_VERIFIED')) {
+        const remote = byId.get(record.captureId);
+        if (!remote || remote.sha256 !== record.sha256) continue;
+        record.state = 'DRIVE_VERIFIED';
+        record.driveFileId = remote.drive_file_id || remote.drive_path || null;
+        record.driveVerifiedAt = body.verified_at || new Date().toISOString();
+        await idbPut(record);
+      }
+    } catch (err) { console.warn('drive status check failed', err); }
+  }
+  await refreshQueue();
 }
 
 function scheduleSessionCommit() {
@@ -545,7 +592,7 @@ async function registerServiceWorker() {
 }
 
 el.shutter.addEventListener('click', capture);
-el.sync.addEventListener('click', () => { void drainQueue(); });
+el.sync.addEventListener('click', () => { void drainQueue(); void checkDriveStatuses(); });
 el.galleryOpen.addEventListener('click', () => { void openGallery(); });
 el.galleryClose.addEventListener('click', closeGallery);
 el.galleryRetry.addEventListener('click', async () => { const records=await idbGetAll(); for (const r of records) { if (r.state !== 'DRIVE_VERIFIED') { r.state='QUEUED'; r.nextAttemptAt=0; await idbPut(r); } } await refreshQueue(); await renderGallery(); void drainQueue(); });
@@ -556,8 +603,8 @@ document.querySelectorAll('.zoom-btn').forEach(btn => btn.addEventListener('clic
 }));
 el.flash.addEventListener('click', () => { void toggleTorch(); });
 el.video.addEventListener('pointerdown', showFocusRing);
-window.addEventListener('online', () => { setStatus('再接続'); void drainQueue(); });
-window.addEventListener('pageshow', () => { void refreshQueue(); void drainQueue(); });
+window.addEventListener('online', () => { setStatus('再接続'); void drainQueue(); void checkDriveStatuses(); });
+window.addEventListener('pageshow', () => { void refreshQueue(); void drainQueue(); void checkDriveStatuses(); });
 window.addEventListener('pagehide', () => stream?.getTracks().forEach(t => t.stop()));
 
 document.addEventListener('visibilitychange', async () => {
@@ -580,6 +627,8 @@ document.addEventListener('visibilitychange', async () => {
     await startCamera();
     void drainQueue();
     void recoverSessionCommit().catch(err => console.warn('commit recovery failed', err));
+    void checkDriveStatuses();
+    setInterval(() => { if (document.visibilityState === 'visible') void checkDriveStatuses(); }, 15000);
   } catch (error) {
     console.error(error);
     setStatus('起動失敗');
