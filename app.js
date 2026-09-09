@@ -3,7 +3,7 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.6.0';
+const APP_VERSION = '0.6.1';
 const COMMIT_IDLE_MS = 60000;
 
 const el = {
@@ -62,7 +62,9 @@ function consumeActivationFragment() {
       ...(transport ? { transport } : {}),
     });
     history.replaceState(null, '', location.pathname + location.search);
+    return true;
   }
+  return false;
 }
 
 function openDb() {
@@ -346,6 +348,14 @@ function retryDelay(retryCount) {
   return [0, 2000, 5000, 15000, 30000, 60000][Math.min(retryCount, 5)];
 }
 
+async function requeueAllPending() {
+  const records = await idbGetAll();
+  for (const r of records) {
+    if (r.state !== 'DRIVE_VERIFIED') { r.state = 'QUEUED'; r.nextAttemptAt = 0; await idbPut(r); }
+  }
+  await refreshQueue();
+}
+
 async function drainQueue() {
   if (uploading) return;
   if (!config.endpoint) { setStatus('端末保存のみ'); await refreshQueue(); return; }
@@ -592,7 +602,7 @@ async function registerServiceWorker() {
 }
 
 el.shutter.addEventListener('click', capture);
-el.sync.addEventListener('click', () => { void drainQueue(); void checkDriveStatuses(); });
+el.sync.addEventListener('click', () => { void requeueAllPending().then(() => drainQueue()); void checkDriveStatuses(); });
 el.galleryOpen.addEventListener('click', () => { void openGallery(); });
 el.galleryClose.addEventListener('click', closeGallery);
 el.galleryRetry.addEventListener('click', async () => { const records=await idbGetAll(); for (const r of records) { if (r.state !== 'DRIVE_VERIFIED') { r.state='QUEUED'; r.nextAttemptAt=0; await idbPut(r); } } await refreshQueue(); await renderGallery(); void drainQueue(); });
@@ -617,11 +627,12 @@ document.addEventListener('visibilitychange', async () => {
 (async function init() {
   try {
     if (!window.isSecureContext) throw new Error('HTTPS_REQUIRED');
-    consumeActivationFragment();
+    const activated = consumeActivationFragment();
     db = await openDb();
     await migrateLegacyBlobs();
     if (navigator.storage?.persist) { try { await navigator.storage.persist(); } catch {} }
     await recoverInterruptedUploads();
+    if (activated) await requeueAllPending();
     await registerServiceWorker();
     await refreshQueue();
     await startCamera();
