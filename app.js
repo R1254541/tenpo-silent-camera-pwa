@@ -3,7 +3,7 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.6.4';
+const APP_VERSION = '0.6.5';
 const COMMIT_IDLE_MS = 60000;
 
 const el = {
@@ -49,12 +49,25 @@ function saveConfig(next) {
   localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
 }
 
-function consumeActivationFragment() {
-  if (!location.hash.startsWith('#')) return;
+async function consumeActivationFragment() {
+  if (!location.hash.startsWith('#')) return false;
   const p = new URLSearchParams(location.hash.slice(1));
+  const activate = p.get('activate');
   const endpoint = p.get('endpoint');
   const token = p.get('token');
   const transport = p.get('transport');
+  if (activate) {
+    const provisionEndpoint = endpoint || 'https://tenpo-camera-ingress-779630765497.asia-northeast1.run.app';
+    const response = await fetch(`${provisionEndpoint}/provision`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: activate }),
+    });
+    if (!response.ok) throw new Error(`PROVISION_HTTP_${response.status}`);
+    const body = await response.json();
+    if (body.ok !== true || !body.token) throw new Error('PROVISION_FAILED');
+    saveConfig({ endpoint: body.endpoint || provisionEndpoint, token: body.token, transport: body.transport || 'cloud-run' });
+    history.replaceState(null, '', location.pathname + location.search);
+    return true;
+  }
   if (endpoint || token || transport) {
     saveConfig({
       ...(endpoint ? { endpoint } : {}),
@@ -658,7 +671,7 @@ document.addEventListener('visibilitychange', async () => {
 (async function init() {
   try {
     if (!window.isSecureContext) throw new Error('HTTPS_REQUIRED');
-    const activated = consumeActivationFragment();
+    const activated = await consumeActivationFragment();
     db = await openDb();
     await migrateLegacyBlobs();
     if (navigator.storage?.persist) { try { await navigator.storage.persist(); } catch {} }

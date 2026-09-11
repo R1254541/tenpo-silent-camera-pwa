@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import hashlib
 import io
 import json
@@ -155,6 +155,33 @@ def health():
     except Exception as e:
         drive_error = type(e).__name__
     return jsonify(ok=True, service='tenpo-camera-ingress-cloudrun-v2', drive_enabled=True, drive_access=drive_access, drive_error=drive_error)
+
+
+@app.route('/provision', methods=['POST', 'OPTIONS'])
+def provision():
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    body = request.get_json(force=True, silent=True) or {}
+    code = str(body.get('code', '')).strip()
+    if not code or len(code) > 128:
+        return jsonify(ok=False, error='INVALID_PROVISION_CODE'), 400
+    marker = bucket.blob('provision/current.json')
+    if not marker.exists():
+        return jsonify(ok=False, error='PROVISION_NOT_AVAILABLE'), 404
+    try:
+        cfg = json.loads(marker.download_as_text())
+    except Exception:
+        return jsonify(ok=False, error='PROVISION_CONFIG_INVALID'), 500
+    if cfg.get('used_at'):
+        return jsonify(ok=False, error='PROVISION_ALREADY_USED'), 409
+    expected = str(cfg.get('code_sha256', ''))
+    if not expected or sha256(code.encode('utf-8')) != expected:
+        return jsonify(ok=False, error='PROVISION_UNAUTHORIZED'), 401
+    if not TOKEN:
+        return jsonify(ok=False, error='TOKEN_NOT_CONFIGURED'), 500
+    cfg['used_at'] = datetime.now(timezone.utc).isoformat()
+    marker.upload_from_string(json.dumps(cfg, ensure_ascii=False), content_type='application/json')
+    return jsonify(ok=True, endpoint=request.url_root.rstrip('/'), transport='cloud-run', token=TOKEN)
 
 
 @app.route('/capture', methods=['POST', 'OPTIONS'])
