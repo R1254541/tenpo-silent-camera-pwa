@@ -3,8 +3,10 @@ const DB_VERSION = 2;
 const STORE = 'captures';
 const CONFIG_KEY = 'tenpo-camera-config-v1';
 const SESSION_KEY = 'tenpo-camera-session-v1';
-const APP_VERSION = '0.6.5';
+const APP_VERSION = '0.6.6';
 const COMMIT_IDLE_MS = 60000;
+const COMMIT_RETRY_MS = 60000;
+const DEFAULT_ENDPOINT = 'https://tenpo-camera-ingress-779630765497.asia-northeast1.run.app';
 
 const el = {
   video: document.querySelector('#preview'),
@@ -57,14 +59,14 @@ async function consumeActivationFragment() {
   const token = p.get('token');
   const transport = p.get('transport');
   if (activate) {
-    const provisionEndpoint = endpoint || 'https://tenpo-camera-ingress-779630765497.asia-northeast1.run.app';
+    const provisionEndpoint = endpoint || DEFAULT_ENDPOINT;
     const response = await fetch(`${provisionEndpoint}/provision`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: activate }),
     });
     if (!response.ok) throw new Error(`PROVISION_HTTP_${response.status}`);
     const body = await response.json();
     if (body.ok !== true || !body.token) throw new Error('PROVISION_FAILED');
-    saveConfig({ endpoint: body.endpoint || provisionEndpoint, token: body.token, transport: body.transport || 'cloud-run' });
+    saveConfig({ endpoint: body.endpoint || provisionEndpoint, token: body.token, transport: body.transport || 'cloud-run', deviceId: config.deviceId || crypto.randomUUID() });
     history.replaceState(null, '', location.pathname + location.search);
     return true;
   }
@@ -78,6 +80,21 @@ async function consumeActivationFragment() {
     return true;
   }
   return false;
+}
+
+async function enrollDeviceInteractive() {
+  const code = window.prompt('\u7aef\u672b\u767b\u9332\u30b3\u30fc\u30c9\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044');
+  if (!code) return false;
+  setStatus('\u7aef\u672b\u767b\u9332\u4e2d');
+  const response = await fetch(`${DEFAULT_ENDPOINT}/provision`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: code.trim() }),
+  });
+  if (!response.ok) throw new Error(`PROVISION_HTTP_${response.status}`);
+  const body = await response.json();
+  if (body.ok !== true || !body.token) throw new Error('PROVISION_FAILED');
+  saveConfig({ endpoint: body.endpoint || DEFAULT_ENDPOINT, token: body.token, transport: body.transport || 'cloud-run', deviceId: config.deviceId || crypto.randomUUID() });
+  setStatus('\u7aef\u672b\u767b\u9332\u6e08\u307f');
+  return true;
 }
 
 function openDb() {
@@ -364,7 +381,7 @@ function retryDelay(retryCount) {
 async function requeueAllPending() {
   const records = await idbGetAll();
   for (const r of records) {
-    if (r.state !== 'DRIVE_VERIFIED') { r.state = 'QUEUED'; r.nextAttemptAt = 0; await idbPut(r); }
+    if (!['DRIVE_VERIFIED','INGRESS_VERIFIED'].includes(r.state)) { r.state = 'QUEUED'; r.nextAttemptAt = 0; await idbPut(r); }
   }
   await refreshQueue();
 }
@@ -540,12 +557,22 @@ async function checkDriveStatuses() {
   await refreshQueue();
 }
 
+async function runCommitAttempt() {
+  try {
+    const ok = await commitCurrentSession();
+    if (!ok) commitTimer = setTimeout(() => void runCommitAttempt(), COMMIT_RETRY_MS);
+  } catch (err) {
+    console.warn('commit failed', err);
+    commitTimer = setTimeout(() => void runCommitAttempt(), COMMIT_RETRY_MS);
+  }
+}
+
 function scheduleSessionCommit() {
   clearTimeout(commitTimer);
   const sess = loadSessionState();
   if (!sess.lastCaptureAt || sess.released) return;
   const due = Math.max(0, COMMIT_IDLE_MS - (Date.now() - Date.parse(sess.lastCaptureAt)));
-  commitTimer = setTimeout(() => { void commitCurrentSession().catch(err => console.warn('commit failed', err)); }, due);
+  commitTimer = setTimeout(() => void runCommitAttempt(), due);
 }
 
 async function recoverHistoricalSessions() {
@@ -629,13 +656,17 @@ function showWarning(text) {
 
 async function recoverInterruptedUploads() {
   const records = await idbGetAll();
+  let nextRetryAt = null;
   for (const record of records) {
-    if (record.state === 'UPLOADING') {
+    if (record.state === 'UPLOADING' || (record.state === 'RETRY_WAIT' && (record.nextAttemptAt || 0) <= Date.now())) {
       record.state = 'QUEUED';
       record.nextAttemptAt = 0;
       await idbPut(record);
+    } else if (record.state === 'RETRY_WAIT' && record.nextAttemptAt) {
+      nextRetryAt = nextRetryAt === null ? record.nextAttemptAt : Math.min(nextRetryAt, record.nextAttemptAt);
     }
   }
+  if (nextRetryAt !== null) setTimeout(() => void drainQueue(), Math.max(0, nextRetryAt - Date.now()));
 }
 
 async function registerServiceWorker() {
@@ -646,10 +677,10 @@ async function registerServiceWorker() {
 }
 
 el.shutter.addEventListener('click', capture);
-el.sync.addEventListener('click', () => { void requeueAllPending().then(() => drainQueue()); void checkDriveStatuses(); });
+el.sync.addEventListener('click', () => { void (async () => { try { if (!config.endpoint || !config.token) await enrollDeviceInteractive(); await requeueAllPending(); await drainQueue(); await checkDriveStatuses(); } catch (err) { console.warn('sync/enroll failed', err); showWarning(`\u7aef\u672b\u767b\u9332/\u518d\u9001\u30a8\u30e9\u30fc: ${err?.message || 'unknown'}`); } })(); });
 el.galleryOpen.addEventListener('click', () => { void openGallery(); });
 el.galleryClose.addEventListener('click', closeGallery);
-el.galleryRetry.addEventListener('click', async () => { const records=await idbGetAll(); for (const r of records) { if (r.state !== 'DRIVE_VERIFIED') { r.state='QUEUED'; r.nextAttemptAt=0; await idbPut(r); } } await refreshQueue(); await renderGallery(); void drainQueue(); });
+el.galleryRetry.addEventListener('click', async () => { const records=await idbGetAll(); for (const r of records) { if (!['DRIVE_VERIFIED','INGRESS_VERIFIED'].includes(r.state)) { r.state='QUEUED'; r.nextAttemptAt=0; await idbPut(r); } } await refreshQueue(); await renderGallery(); void drainQueue(); });
 el.zoom.addEventListener('input', e => { void applyZoom(e.target.value); });
 document.querySelectorAll('.zoom-btn').forEach(btn => btn.addEventListener('click', () => {
   el.zoom.value = btn.dataset.zoom;
@@ -679,6 +710,7 @@ document.addEventListener('visibilitychange', async () => {
     if (activated) await requeueAllPending();
     await registerServiceWorker();
     await refreshQueue();
+    if (!config.endpoint || !config.token) { setStatus('\u7aef\u672b\u672a\u767b\u9332'); showWarning('\u518d\u9001\u3092\u62bc\u3057\u3066\u3001\u3053\u306ePWA\u5185\u3067\u7aef\u672b\u767b\u9332\u3057\u3066\u304f\u3060\u3055\u3044'); }
     await startCamera();
     await drainQueue();
     await recoverHistoricalSessions();

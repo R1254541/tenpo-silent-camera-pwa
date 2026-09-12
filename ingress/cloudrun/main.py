@@ -63,7 +63,7 @@ def qescape(value):
 
 def find_folder(name, parent_id):
     q = f"name = '{qescape(name)}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '{parent_id}' in parents"
-    rows = drive().files().list(q=q, spaces='drive', fields='files(id,name,parents)', pageSize=10).execute().get('files', [])
+    rows = drive().files().list(q=q, spaces='drive', fields='files(id,name,parents)', pageSize=10, supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get('files', [])
     return rows[0] if rows else None
 
 
@@ -72,12 +72,12 @@ def ensure_folder(name, parent_id):
     if found:
         return found['id']
     body = {'name': name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
-    return drive().files().create(body=body, fields='id').execute()['id']
+    return drive().files().create(body=body, fields='id', supportsAllDrives=True).execute()['id']
 
 
 def find_file(name, parent_id):
     q = f"name = '{qescape(name)}' and trashed = false and '{parent_id}' in parents"
-    rows = drive().files().list(q=q, spaces='drive', fields='files(id,name,parents,appProperties,size)', pageSize=10).execute().get('files', [])
+    rows = drive().files().list(q=q, spaces='drive', fields='files(id,name,parents,appProperties,size)', pageSize=10, supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get('files', [])
     return rows[0] if rows else None
 
 
@@ -89,20 +89,20 @@ def upload_bytes(name, parent_id, data, mime_type, app_properties=None):
     body = {'name': name, 'parents': [parent_id]}
     if app_properties:
         body['appProperties'] = {k: str(v) for k, v in app_properties.items()}
-    return drive().files().create(body=body, media_body=media, fields='id').execute()['id']
+    return drive().files().create(body=body, media_body=media, fields='id', supportsAllDrives=True).execute()['id']
 
 
 def replace_bytes(name, parent_id, data, mime_type):
     found = find_file(name, parent_id)
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
     if found:
-        drive().files().update(fileId=found['id'], media_body=media, fields='id').execute()
+        drive().files().update(fileId=found['id'], media_body=media, fields='id', supportsAllDrives=True).execute()
         return found['id']
-    return drive().files().create(body={'name': name, 'parents': [parent_id]}, media_body=media, fields='id').execute()['id']
+    return drive().files().create(body={'name': name, 'parents': [parent_id]}, media_body=media, fields='id', supportsAllDrives=True).execute()['id']
 
 
 def download_bytes(file_id):
-    req = drive().files().get_media(fileId=file_id)
+    req = drive().files().get_media(fileId=file_id, supportsAllDrives=True)
     fh = io.BytesIO()
     dl = MediaIoBaseDownload(fh, req)
     done = False
@@ -133,7 +133,7 @@ def session_folder(sid, create=False):
 
 
 def move_session_to_release(folder_id):
-    meta = drive().files().get(fileId=folder_id, fields='parents').execute()
+    meta = drive().files().get(fileId=folder_id, fields='parents', supportsAllDrives=True).execute()
     parents = meta.get('parents', [])
     if RELEASE_PARENT_ID in parents:
         return
@@ -142,6 +142,7 @@ def move_session_to_release(folder_id):
         addParents=RELEASE_PARENT_ID,
         removeParents=','.join(parents),
         fields='id,parents',
+        supportsAllDrives=True,
     ).execute()
 
 
@@ -150,7 +151,7 @@ def health():
     drive_access = False
     drive_error = None
     try:
-        drive().files().get(fileId=STAGING_PARENT_ID, fields='id,name').execute()
+        drive().files().get(fileId=STAGING_PARENT_ID, fields='id,name', supportsAllDrives=True).execute()
         drive_access = True
     except Exception as e:
         drive_error = type(e).__name__
@@ -227,31 +228,12 @@ def capture():
     mb = bucket.blob(f"sessions/{meta['session_id']}/META_{seq:04d}_{meta['capture_id']}.json")
     mb.upload_from_string(json.dumps(meta, ensure_ascii=False), content_type='application/json')
 
-    try:
-        sfid, where = session_folder(str(meta['session_id']), create=True)
-        if where == 'released':
-            return jsonify(ok=False, error='SESSION_ALREADY_RELEASED'), 409
-        drive_name = f"TC_{seq:04d}_{meta['capture_id']}.jpg"
-        dfid = upload_bytes(
-            drive_name,
-            sfid,
-            data,
-            'image/jpeg',
-            {'capture_id': meta['capture_id'], 'session_id': meta['session_id'], 'sequence': seq, 'sha256': got},
-        )
-        verify_drive_file(dfid, got, len(data))
-        meta_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode('utf-8')
-        replace_bytes(f"META_{seq:04d}_{meta['capture_id']}.json", sfid, meta_bytes, 'application/json')
-    except Exception as e:
-        app.logger.exception('Drive staging failed')
-        return jsonify(ok=False, error='DRIVE_STAGE_FAILED', detail=str(e)[:240]), 503
-
     return jsonify(
         ok=True,
         ingress_verified=True,
-        drive_staged_verified=True,
+        drive_staged_verified=False,
         server_id=gcs_name,
-        drive_file_id=dfid,
+        drive_file_id=None,
         received_sha256=got,
     )
 
@@ -277,9 +259,7 @@ def commit():
     if len({m['capture_id'] for m in metas}) != expected:
         return jsonify(ok=False, error='SESSION_DUPLICATE_CAPTURE_ID'), 409
 
-    sfid, where = session_folder(sid, create=False)
-    if not sfid:
-        return jsonify(ok=False, error='DRIVE_SESSION_MISSING'), 409
+    sfid, where = session_folder(sid, create=True)
 
     manifest = {'schema_version': 'cloudrun-drive-2', 'session_id': sid, 'expected_count': expected, 'images': []}
     status_images = []
@@ -293,8 +273,13 @@ def commit():
             drive_name = f"TC_{seq:04d}_{m['capture_id']}.jpg"
             dfile = find_file(drive_name, sfid)
             if not dfile:
-                return jsonify(ok=False, error='DRIVE_FILE_MISSING'), 409
+                dfid = upload_bytes(
+                    drive_name, sfid, data, 'image/jpeg',
+                    {'capture_id': m['capture_id'], 'session_id': sid, 'sequence': seq, 'sha256': m['sha256']},
+                )
+                dfile = {'id': dfid}
             verify_drive_file(dfile['id'], m['sha256'], len(data))
+            replace_bytes(f"META_{seq:04d}_{m['capture_id']}.json", sfid, json.dumps(m, ensure_ascii=False, indent=2).encode('utf-8'), 'application/json')
             image_info = {
                 'capture_id': m['capture_id'], 'sequence': seq, 'captured_at': m.get('captured_at'),
                 'filename': drive_name, 'size_bytes': len(data), 'sha256': m['sha256'], 'drive_file_id': dfile['id'],
