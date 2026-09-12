@@ -7,6 +7,9 @@ import re
 from datetime import datetime, timezone
 
 import google.auth
+from google.auth import iam
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import service_account
 from flask import Flask, jsonify, request
 from google.cloud import storage
 from googleapiclient.discovery import build
@@ -14,8 +17,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 app = Flask(__name__)
 BUCKET = os.environ.get('BUCKET', 'm-bridge-504512-tenpo-camera-ingress')
-STAGING_PARENT_ID = os.environ.get('DRIVE_STAGING_FOLDER_ID', '1JE9ZpfCfY5gJHD0Z89H1Z3xsGwLqf-g_')
-RELEASE_PARENT_ID = os.environ.get('DRIVE_RELEASE_FOLDER_ID', '1jYxWoa5mkfyRHQpDoGTNW8_3mgHcFS41')
+STAGING_PARENT_ID = os.environ.get('DRIVE_STAGING_FOLDER_ID', '1kxGWrz3Ly3iosLSEUGsnduANgiAKlyeC')
+RELEASE_PARENT_ID = os.environ.get('DRIVE_RELEASE_FOLDER_ID', '1OGYUSp3D5k66gRaC2Hhk4T8Xy0tZYTaO')
 TOKEN = os.environ.get('TENPO_TOKEN', '').strip()
 if not TOKEN:
     token_path = os.path.join(os.path.dirname(__file__), 'token.txt')
@@ -26,14 +29,29 @@ client = storage.Client()
 bucket = client.bucket(BUCKET)
 UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}$')
 DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
+DRIVE_IMPERSONATE_USER = os.environ.get('DRIVE_IMPERSONATE_USER', '').strip()
+DWD_SERVICE_ACCOUNT_EMAIL = os.environ.get('DWD_SERVICE_ACCOUNT_EMAIL', '779630765497-compute@developer.gserviceaccount.com').strip()
 _drive = None
+
+
+def drive_credentials():
+    source_creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+    if not DRIVE_IMPERSONATE_USER:
+        return google.auth.default(scopes=[DRIVE_SCOPE])[0]
+    signer = iam.Signer(GoogleAuthRequest(), source_creds, DWD_SERVICE_ACCOUNT_EMAIL)
+    return service_account.Credentials(
+        signer=signer,
+        service_account_email=DWD_SERVICE_ACCOUNT_EMAIL,
+        token_uri='https://oauth2.googleapis.com/token',
+        scopes=[DRIVE_SCOPE],
+        subject=DRIVE_IMPERSONATE_USER,
+    )
 
 
 def drive():
     global _drive
     if _drive is None:
-        creds, _ = google.auth.default(scopes=[DRIVE_SCOPE])
-        _drive = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        _drive = build('drive', 'v3', credentials=drive_credentials(), cache_discovery=False)
     return _drive
 
 
