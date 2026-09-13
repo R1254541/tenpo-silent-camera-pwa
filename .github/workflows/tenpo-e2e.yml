@@ -1,0 +1,43 @@
+name: Tenpo Camera E2E
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ingress/cloudrun/e2e_job.py'
+      - 'ingress/cloudrun/Dockerfile'
+      - '.github/workflows/tenpo-e2e.yml'
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT: m-bridge-504512
+      REGION: asia-northeast1
+      IMAGE: asia-northeast1-docker.pkg.dev/m-bridge-504512/cloud-run-source-deploy/tenpo-camera-ingress:${{ github.sha }}-e2e
+      JOB: tenpo-camera-e2e
+      RUNTIME_SA: 779630765497-compute@developer.gserviceaccount.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/779630765497/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: tenpo-github-ci@m-bridge-504512.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker asia-northeast1-docker.pkg.dev --quiet
+      - run: docker build -t "$IMAGE" ingress/cloudrun
+      - run: docker push "$IMAGE"
+      - name: Deploy E2E job
+        run: |
+          gcloud run jobs deploy "$JOB" --image "$IMAGE" --region "$REGION" --project "$PROJECT" \
+            --service-account "$RUNTIME_SA" --max-retries 0 --task-timeout 300s \
+            --set-env-vars "SERVICE_URL=https://tenpo-camera-ingress-779630765497.asia-northeast1.run.app,BUCKET=m-bridge-504512-tenpo-camera-ingress,DRIVE_STAGING_FOLDER_ID=1kxGWrz3Ly3iosLSEUGsnduANgiAKlyeC,DRIVE_RELEASE_FOLDER_ID=1OGYUSp3D5k66gRaC2Hhk4T8Xy0tZYTaO,DRIVE_IMPERSONATE_USER=admin@tmasterec.com,DWD_SERVICE_ACCOUNT_EMAIL=779630765497-compute@developer.gserviceaccount.com" \
+            --set-secrets "TENPO_TOKEN=tenpo-camera-token:latest" \
+            --command python --args /app/e2e_job.py --quiet
+      - name: Execute E2E job
+        run: gcloud run jobs execute "$JOB" --region "$REGION" --project "$PROJECT" --wait --quiet
+      - name: Cleanup job
+        if: always()
+        run: gcloud run jobs delete "$JOB" --region "$REGION" --project "$PROJECT" --quiet || true
